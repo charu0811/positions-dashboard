@@ -1,11 +1,10 @@
 import streamlit as st
 import xlwings as xw
 import pandas as pd
-import numpy as np
 import time
 
 # -----------------------------------------------------------------------------
-# CONFIGURATION & SETUP
+# CONFIGURATION
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="DAP Position Manager",
@@ -14,300 +13,261 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-EXCEL_FILE_NAME = "Live_DAP.xlsx"
+TARGET_FILE_KEYWORD = "Live_DAP" # Will look for any book containing this
+SHEET_MAIN = "DAP_Main"
+SHEET_PROFIT = "Profit"
 
 # -----------------------------------------------------------------------------
-# DATA CONNECTION FUNCTIONS
+# ROBUST CONNECTION FUNCTION
 # -----------------------------------------------------------------------------
-@st.cache_resource
-def get_excel_app():
+def connect_to_excel():
     """
-    Connects to the active Excel instance.
-    We use cache_resource to avoid re-connecting on every rerun,
-    though xlwings handles this gracefully.
+    Tries to find the Excel book using multiple methods.
+    Returns: (book_object, status_message, is_success)
     """
     try:
-        # Try to connect to the specific book if open
-        book = xw.books[EXCEL_FILE_NAME]
-        return book
+        # 1. Try connecting to the specific name
+        try:
+            return xw.books['Live_DAP.xlsx'], "Connected to Live_DAP.xlsx", True
+        except:
+            pass
+
+        # 2. Search through all open books for a partial match
+        apps = xw.apps
+        found_books = []
+        for app in apps:
+            for book in app.books:
+                found_books.append(book.name)
+                if TARGET_FILE_KEYWORD.lower() in book.name.lower():
+                    return book, f"Found open file: {book.name}", True
+        
+        # 3. If we are here, we couldn't find it. Return list of what we found.
+        if found_books:
+            return None, f"Could not find '{TARGET_FILE_KEYWORD}'. Found: {', '.join(found_books)}", False
+        else:
+            return None, "No Excel instances found. Is Excel open?", False
+
     except Exception as e:
-        return None
+        return None, f"Critical Error: {str(e)}", False
 
-def fetch_market_data(book):
+# -----------------------------------------------------------------------------
+# SMART DATA PARSING
+# -----------------------------------------------------------------------------
+def get_column_indices(header_row):
     """
-    Reads the DAP_Main sheet and parses the stacked tables 
-    (Outrights, Spreads, Flies) into a single clean DataFrame.
+    Scans the header row to find where Outrights, Spreads, and Flies start.
     """
+    indices = {
+        'outright_name': 0, 'outright_last': 1, 'outright_tv': 8,
+        'spread_name': -1, 'spread_last': -1,
+        'fly_name': -1, 'fly_last': -1
+    }
+    
+    # Convert header row to list of strings
+    headers = [str(x).strip() if x else "" for x in header_row]
+    
+    # 1. Scan for "Spread" and "Fly" headers
+    # We assume 'Last' or 'LTP' follows the name
+    
+    for i, col_name in enumerate(headers):
+        if col_name == "Spread":
+            indices['spread_name'] = i
+            # Usually Last/LTP is next to it
+            if i+1 < len(headers): indices['spread_last'] = i+1
+            
+        if col_name == "Fly":
+            indices['fly_name'] = i
+            if i+1 < len(headers): indices['fly_last'] = i+1
+            
+        # Refine Tick Value search (usually near Outrights)
+        if "Tick Value" in col_name and i < 15:
+            indices['outright_tv'] = i
+
+    return indices
+
+def parse_market_data(book):
     try:
-        sheet = book.sheets['DAP_Main']
-        # Read the used range. We assume a reasonable max size to keep it fast.
-        # Adjust 'A1:Z500' if your sheet is massive.
-        raw_data = sheet.range('A1:P200').options(pd.DataFrame, header=1, index=False).value
+        sheet = book.sheets[SHEET_MAIN]
         
-        # The sheet has multiple headers (Outrights, Spread, Fly)
-        # We need to normalize this into a clean "Instrument -> Price" lookup.
+        # Pull large range
+        # We assume headers are in Row 1 (index 0) or Row 2 (index 1)
+        # We grab A1 to AZ300
+        raw_values = sheet.range('A1:AZ300').options(pd.DataFrame, header=False, index=False).value
         
-        market_data = []
+        # Find the header row (contains "Outright" or "Spread")
+        header_idx = 0
+        found_header = False
+        for i in range(5): # Check first 5 rows
+            row_str = [str(x) for x in raw_values.iloc[i].tolist()]
+            if "Outright" in row_str or "Spread" in row_str:
+                header_idx = i
+                found_header = True
+                break
         
-        # 1. Identify rows that look like data
-        # We look for rows where column 0 (Symbol) is not None and not a Header keyword
-        # Based on CSV: Col 0 is Symbol, Col 1 is Last, Col 2 is Settle, etc.
+        if not found_header:
+            return pd.DataFrame(), "Could not find headers in DAP_Main"
+
+        headers = raw_values.iloc[header_idx].tolist()
+        idxs = get_column_indices(headers)
         
-        # Clean numeric columns helper
-        def clean_float(val):
+        market_data = {}
+        
+        # Helper
+        def clean_val(val):
             try:
                 return float(val)
             except:
                 return 0.0
 
-        for index, row in raw_data.iterrows():
-            symbol = row.iloc[0] # Assuming first column is Instrument Name
+        # Iterate rows after header
+        for i in range(header_idx + 1, len(raw_values)):
+            row = raw_values.iloc[i]
             
-            # Skip empty rows or header repeaters
-            if pd.isna(symbol) or str(symbol).strip() in ['Outrights', 'Spread', 'Fly', 'Symbol', 'Last']:
-                continue
+            # --- Outrights ---
+            name = row[idxs['outright_name']]
+            if name and isinstance(name, str) and len(name) < 10:
+                market_data[name] = {
+                    "Type": "Outright",
+                    "Price": clean_val(row[idxs['outright_last']]),
+                    "TickValue": clean_val(row[idxs['outright_tv']]) if idxs['outright_tv'] != -1 else 100.0
+                }
                 
-            # Extract basic data (Adjust indices based on your exact column layout)
-            # Based on CSV snippet: 
-            # Col 0: Symbol (Z25)
-            # Col 1: Last (12.292)
-            # Col 2: Settle
-            # Col 3: BidQty
-            # Col 4: Bid
-            # Col 5: Ask
-            # Col 8: Tick Value (roughly) - This varies in the csv, we'll try to catch it
-            
-            try:
-                last_price = clean_float(row.iloc[1])
-                bid = clean_float(row.iloc[4])
-                ask = clean_float(row.iloc[5])
-                
-                # Tick Value often appears around column 8 or 9 in your sheet
-                # We default to 100 if missing/zero, to prevent PnL errors
-                tick_value = clean_float(row.iloc[8]) 
-                if tick_value == 0: tick_value = 100.0 
+            # --- Spreads ---
+            if idxs['spread_name'] != -1:
+                s_name = row[idxs['spread_name']]
+                if s_name and isinstance(s_name, str):
+                    market_data[s_name] = {
+                        "Type": "Spread",
+                        "Price": clean_val(row[idxs['spread_last']]),
+                        "TickValue": 100.0
+                    }
 
-                market_data.append({
-                    "Instrument": str(symbol).strip(),
-                    "Last": last_price,
-                    "Bid": bid,
-                    "Ask": ask,
-                    "TickValue": tick_value
-                })
-            except Exception as e:
-                continue
+            # --- Flies ---
+            if idxs['fly_name'] != -1:
+                f_name = row[idxs['fly_name']]
+                if f_name and isinstance(f_name, str):
+                    market_data[f_name] = {
+                        "Type": "Fly",
+                        "Price": clean_val(row[idxs['fly_last']]),
+                        "TickValue": 100.0
+                    }
 
-        return pd.DataFrame(market_data)
+        df = pd.DataFrame.from_dict(market_data, orient='index').reset_index().rename(columns={"index": "Instrument"})
+        return df, "Success"
 
     except Exception as e:
-        st.error(f"Error reading market data: {e}")
-        return pd.DataFrame()
-
-def fetch_excel_positions(book):
-    """
-    Attempts to read the 'Profit' sheet. 
-    Since the format is complex (Strategy blocks), we grab the raw values 
-    for display or simple parsing.
-    """
-    try:
-        sheet = book.sheets['Profit']
-        # Grabbing a large block to display raw for now
-        data = sheet.range('A1:Z50').options(pd.DataFrame).value
-        return data
-    except:
-        return pd.DataFrame()
+        return pd.DataFrame(), f"Error parsing data: {str(e)}"
 
 # -----------------------------------------------------------------------------
-# SIDEBAR
+# MAIN APP
 # -----------------------------------------------------------------------------
-st.sidebar.title("🎮 DAP Manager")
-st.sidebar.markdown("---")
+st.title("📊 DAP Live Manager")
 
-# Connection Status
-book = get_excel_app()
-if book:
-    st.sidebar.success(f"Connected: {EXCEL_FILE_NAME}")
-    if st.sidebar.button("🔄 Refresh Data"):
-        st.rerun()
-else:
-    st.sidebar.error(f"Not Found: {EXCEL_FILE_NAME}")
-    st.sidebar.warning("Please open the Excel file and reload.")
-    st.stop() # Stop execution if no excel
+# Sidebar Status
+with st.sidebar:
+    st.header("Connection Status")
+    
+    book, msg, success = connect_to_excel()
+    
+    if success:
+        st.success(msg)
+        if st.button("🔄 Refresh Data"):
+            st.rerun()
+    else:
+        st.error("Connection Failed")
+        st.warning(msg)
+        if st.button("Retry Connection"):
+            st.rerun()
+        st.stop()
 
-# Auto Refresh logic (simple loop)
-auto_refresh = st.sidebar.checkbox("Auto-Refresh (5s)", value=False)
-if auto_refresh:
-    time.sleep(5)
-    st.rerun()
+# Initialize Session State
+if 'positions' not in st.session_state:
+    st.session_state['positions'] = []
 
-# -----------------------------------------------------------------------------
-# MAIN LOGIC
-# -----------------------------------------------------------------------------
+def add_pos(inst, lots, entry, tv):
+    st.session_state['positions'].append({
+        "id": int(time.time()*1000),
+        "Instrument": inst, "Lots": lots, "Entry": entry, "TV": tv
+    })
 
-# 1. Load Market Data
-df_market = fetch_market_data(book)
+# Load Data
+df_market, data_msg = parse_market_data(book)
 
 if df_market.empty:
-    st.warning("Could not parse market data from 'DAP_Main'. Check column layout.")
-else:
-    # Set index for easy lookup
-    df_market.set_index("Instrument", inplace=True)
+    st.error(f"Data Error: {data_msg}")
+    st.stop()
 
-# -----------------------------------------------------------------------------
 # TABS
-# -----------------------------------------------------------------------------
-tab1, tab2, tab3 = st.tabs(["📊 Live Positions & Dashboard", "🛠 Build Strategy", "📋 Raw Data"])
+t1, t2, t3 = st.tabs(["Monitor", "Builder", "Raw Data"])
 
-# --- TAB 1: DASHBOARD ---
-with tab1:
-    st.header("Live Position Monitor")
-    
-    # Initialize Session State for Positions if not exists
-    if 'positions' not in st.session_state:
-        st.session_state.positions = []
-
-    # Calculate PnL for stored positions
-    if not st.session_state.positions:
-        st.info("No active positions tracked in Dashboard. Add one in the 'Build Strategy' tab.")
+with t1:
+    if not st.session_state['positions']:
+        st.info("No positions. Add one in the 'Builder' tab.")
     else:
-        portfolio_data = []
+        portfolio = []
         total_pnl = 0.0
-
-        for pos in st.session_state.positions:
-            # pos structure: {'name': 'Fly1', 'legs': [('Q26', 1), ('K27', -2), ('Q28', 1)], 'lots': 10, 'entry': 5.5}
-            
-            current_structure_price = 0.0
-            avg_tick_value = 0.0
-            valid_price = True
-            
-            leg_details = []
-
-            for instrument, ratio in pos['legs']:
-                if instrument in df_market.index:
-                    price = df_market.loc[instrument, 'Last']
-                    tv = df_market.loc[instrument, 'TickValue']
-                    
-                    current_structure_price += (price * ratio)
-                    avg_tick_value = tv # Taking last leg's TV or average
-                    
-                    leg_details.append(f"{instrument}({price})")
-                else:
-                    valid_price = False
-                    leg_details.append(f"{instrument}(N/A)")
-
-            # PnL Calculation
-            # PnL = (Current Price - Entry Price) * Lots * TickValue
-            # Note: For spreads/flies, ensure the price scaling matches your TV convention
-            
-            if valid_price:
-                diff = current_structure_price - pos['entry']
-                pnl = diff * pos['lots'] * avg_tick_value
+        
+        for p in st.session_state['positions']:
+            row = df_market[df_market['Instrument'] == p['Instrument']]
+            if not row.empty:
+                curr = row.iloc[0]['Price']
+                tv = p['TV'] if p['TV'] else row.iloc[0]['TickValue']
+                # PnL logic
+                pnl = (curr - p['Entry']) * p['Lots'] * tv
                 total_pnl += pnl
+                portfolio.append({
+                    "ID": p['id'], "Instrument": p['Instrument'], 
+                    "Lots": p['Lots'], "Entry": p['Entry'], 
+                    "Live": curr, "PnL": pnl
+                })
             else:
-                pnl = 0.0
-
-            portfolio_data.append({
-                "Strategy": pos['name'],
-                "Composition": " | ".join([f"{r}x{i}" for i, r in pos['legs']]),
-                "Lots": pos['lots'],
-                "Entry Price": pos['entry'],
-                "Live Price": round(current_structure_price, 4),
-                "Diff": round(current_structure_price - pos['entry'], 4),
-                "Tick Val": avg_tick_value,
-                "PnL": round(pnl, 2)
-            })
-
-        df_portfolio = pd.DataFrame(portfolio_data)
+                 portfolio.append({
+                    "ID": p['id'], "Instrument": p['Instrument'], 
+                    "Lots": p['Lots'], "Entry": p['Entry'], 
+                    "Live": 0.0, "PnL": 0.0
+                })
         
-        # Display Metrics
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Open PnL", f"${total_pnl:,.2f}")
-        col2.metric("Active Strategies", len(st.session_state.positions))
+        st.metric("Total PnL", f"${total_pnl:,.2f}")
         
-        # Display Table with styling
-        st.dataframe(
-            df_portfolio.style.format({
-                "Entry Price": "{:.4f}",
-                "Live Price": "{:.4f}",
-                "Diff": "{:.4f}",
-                "PnL": "{:.2f}"
-            }).background_gradient(subset=['PnL'], cmap='RdYlGn', vmin=-1000, vmax=1000),
-            use_container_width=True
-        )
-        
-        if st.button("Clear All Positions"):
-            st.session_state.positions = []
-            st.rerun()
-
-# --- TAB 2: BUILD STRATEGY ---
-with tab2:
-    st.subheader("Strategy Builder")
-    st.markdown("Construct a Spread or Fly using live instruments found in `DAP_Main`.")
-
-    col_build_1, col_build_2 = st.columns([1, 2])
-
-    with col_build_1:
-        st.markdown("#### Configuration")
-        strat_type = st.radio("Type", ["Spread (2 Legs)", "Fly (3 Legs)", "Custom"])
-        strat_name = st.text_input("Strategy Name", value="My Strategy")
-        
-        lots = st.number_input("Lots", value=1, step=1)
-        entry_price = st.number_input("Entry Price", value=0.0, format="%.4f", help="Price at which you entered the trade")
-
-    with col_build_2:
-        st.markdown("#### Leg Selection")
-        available_instruments = sorted(df_market.index.tolist())
-        
-        legs = []
-        
-        if strat_type == "Spread (2 Legs)":
-            l1 = st.selectbox("Leg 1 (Long)", available_instruments, index=0)
-            l2 = st.selectbox("Leg 2 (Short)", available_instruments, index=1)
-            legs = [(l1, 1), (l2, -1)]
+        # Table
+        for item in portfolio:
+            c1, c2, c3, c4, c5 = st.columns([3, 1, 2, 2, 1])
+            c1.write(f"**{item['Instrument']}**")
+            c2.write(f"{item['Lots']} lots")
+            c3.write(f"@{item['Entry']}")
             
-        elif strat_type == "Fly (3 Legs)":
-            l1 = st.selectbox("Leg 1 (Wing)", available_instruments, index=0)
-            l2 = st.selectbox("Leg 2 (Body)", available_instruments, index=1)
-            l3 = st.selectbox("Leg 3 (Wing)", available_instruments, index=2)
-            legs = [(l1, 1), (l2, -2), (l3, 1)]
+            val_color = "green" if item['PnL'] >= 0 else "red"
+            c4.markdown(f":{val_color}[${item['PnL']:,.2f}]")
             
-        else: # Custom
-            st.info("Add legs manually below")
-            num_legs = st.number_input("Number of Legs", 1, 10, 4)
-            for i in range(int(num_legs)):
-                c1, c2 = st.columns(2)
-                inst = c1.selectbox(f"Inst {i+1}", available_instruments, key=f"inst_{i}")
-                ratio = c2.number_input(f"Ratio {i+1}", value=1.0, key=f"ratio_{i}")
-                legs.append((inst, ratio))
+            if c5.button("🗑", key=item['ID']):
+                st.session_state['positions'] = [x for x in st.session_state['positions'] if x['id'] != item['ID']]
+                st.rerun()
+            st.divider()
 
-        # Live Preview
-        preview_price = 0.0
-        details = []
-        for inst, ratio in legs:
-            if inst in df_market.index:
-                p = df_market.loc[inst, 'Last']
-                preview_price += (p * ratio)
-                details.append(f"{ratio}x {inst} @ {p}")
-        
-        st.info(f"**Live Structure Price:** {preview_price:.4f}")
-        st.caption(f"Calculation: {' + '.join(details)}")
-        
-        if st.button("Add to Dashboard", type="primary"):
-            new_position = {
-                'name': strat_name,
-                'legs': legs,
-                'lots': lots,
-                'entry': entry_price
-            }
-            st.session_state.positions.append(new_position)
-            st.success("Position Added! Go to 'Live Positions' tab to monitor.")
-
-# --- TAB 3: RAW DATA ---
-with tab3:
-    st.subheader("Raw Market Data (DAP_Main)")
-    st.dataframe(df_market, height=400)
+with t2:
+    st.subheader("Add Trade")
+    # Clean list
+    opts = sorted(df_market['Instrument'].unique().tolist())
+    sel = st.selectbox("Instrument", opts)
     
-    st.subheader("Excel 'Profit' Sheet View")
-    st.caption("Raw dump of the sheet for reference")
-    df_excel_profit = fetch_excel_positions(book)
-    st.dataframe(df_excel_profit)
+    curr_data = df_market[df_market['Instrument'] == sel].iloc[0]
+    st.caption(f"Live Price: {curr_data['Price']} | Type: {curr_data['Type']}")
+    
+    c1, c2 = st.columns(2)
+    l = c1.number_input("Lots", value=1)
+    e = c2.number_input("Entry", value=curr_data['Price'], format="%.4f")
+    tv = st.number_input("Tick Value", value=curr_data['TickValue'])
+    
+    if st.button("Add"):
+        add_pos(sel, l, e, tv)
+        st.success("Added!")
+        time.sleep(0.5)
+        st.rerun()
+
+with t3:
+    st.write(df_market)
+    if st.button("Show Profit Sheet Raw"):
+        try:
+            st.write(book.sheets[SHEET_PROFIT].range('A1:Z100').options(pd.DataFrame).value)
+        except:
+            st.error("Profit sheet not found")
