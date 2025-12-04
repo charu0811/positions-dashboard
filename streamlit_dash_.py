@@ -1,7 +1,9 @@
 import streamlit as st
-import xlwings as xw
 import pandas as pd
+import numpy as np
 import time
+import sys
+import platform
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION
@@ -13,261 +15,274 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-TARGET_FILE_KEYWORD = "Live_DAP" # Will look for any book containing this
+FILE_NAME = "Live_DAP.xlsx"
 SHEET_MAIN = "DAP_Main"
 SHEET_PROFIT = "Profit"
 
 # -----------------------------------------------------------------------------
-# ROBUST CONNECTION FUNCTION
+# HYBRID DATA LOADER (XLWINGS vs PANDAS)
 # -----------------------------------------------------------------------------
-def connect_to_excel():
+def load_data():
     """
-    Tries to find the Excel book using multiple methods.
-    Returns: (book_object, status_message, is_success)
+    Attempts to connect to live Excel. If that fails (Linux/Server), 
+    falls back to reading the file from disk.
     """
+    system = platform.system()
+    
+    # CASE 1: Linux / Server Environment (No Live Excel)
+    if system == "Linux":
+        return None, "Static Mode (Linux)", False
+
+    # CASE 2: Windows/Mac (Try Live Connection)
     try:
-        # 1. Try connecting to the specific name
+        import xlwings as xw
+        # Try specific name
         try:
-            return xw.books['Live_DAP.xlsx'], "Connected to Live_DAP.xlsx", True
+            book = xw.books[FILE_NAME]
+            return book, "Connected Live", True
         except:
-            pass
-
-        # 2. Search through all open books for a partial match
-        apps = xw.apps
-        found_books = []
-        for app in apps:
-            for book in app.books:
-                found_books.append(book.name)
-                if TARGET_FILE_KEYWORD.lower() in book.name.lower():
-                    return book, f"Found open file: {book.name}", True
+            # Try finding by partial name
+            for app in xw.apps:
+                for bk in app.books:
+                    if "Live_DAP" in bk.name:
+                        return bk, f"Connected: {bk.name}", True
         
-        # 3. If we are here, we couldn't find it. Return list of what we found.
-        if found_books:
-            return None, f"Could not find '{TARGET_FILE_KEYWORD}'. Found: {', '.join(found_books)}", False
-        else:
-            return None, "No Excel instances found. Is Excel open?", False
-
+        return None, "Excel file not found. Open Live_DAP.xlsx", False
+    except ImportError:
+        return None, "xlwings not installed", False
     except Exception as e:
-        return None, f"Critical Error: {str(e)}", False
+        return None, f"Connection Error: {e}", False
 
-# -----------------------------------------------------------------------------
-# SMART DATA PARSING
-# -----------------------------------------------------------------------------
-def get_column_indices(header_row):
+def fetch_market_data(book, is_live):
     """
-    Scans the header row to find where Outrights, Spreads, and Flies start.
+    Fetches data from DAP_Main. 
+    If is_live=True, uses xlwings.
+    If is_live=False, uses pandas read_excel.
     """
-    indices = {
-        'outright_name': 0, 'outright_last': 1, 'outright_tv': 8,
-        'spread_name': -1, 'spread_last': -1,
-        'fly_name': -1, 'fly_last': -1
-    }
-    
-    # Convert header row to list of strings
-    headers = [str(x).strip() if x else "" for x in header_row]
-    
-    # 1. Scan for "Spread" and "Fly" headers
-    # We assume 'Last' or 'LTP' follows the name
-    
-    for i, col_name in enumerate(headers):
-        if col_name == "Spread":
-            indices['spread_name'] = i
-            # Usually Last/LTP is next to it
-            if i+1 < len(headers): indices['spread_last'] = i+1
-            
-        if col_name == "Fly":
-            indices['fly_name'] = i
-            if i+1 < len(headers): indices['fly_last'] = i+1
-            
-        # Refine Tick Value search (usually near Outrights)
-        if "Tick Value" in col_name and i < 15:
-            indices['outright_tv'] = i
-
-    return indices
-
-def parse_market_data(book):
     try:
-        sheet = book.sheets[SHEET_MAIN]
-        
-        # Pull large range
-        # We assume headers are in Row 1 (index 0) or Row 2 (index 1)
-        # We grab A1 to AZ300
-        raw_values = sheet.range('A1:AZ300').options(pd.DataFrame, header=False, index=False).value
-        
-        # Find the header row (contains "Outright" or "Spread")
-        header_idx = 0
-        found_header = False
-        for i in range(5): # Check first 5 rows
-            row_str = [str(x) for x in raw_values.iloc[i].tolist()]
-            if "Outright" in row_str or "Spread" in row_str:
-                header_idx = i
-                found_header = True
+        # --- STRATEGY: GET RAW DATA ---
+        if is_live and book:
+            sheet = book.sheets[SHEET_MAIN]
+            # Grab A1:AZ300
+            df_raw = sheet.range('A1:AZ300').options(pd.DataFrame, header=False, index=False).value
+        else:
+            # Static Fallback
+            df_raw = pd.read_excel(FILE_NAME, sheet_name=SHEET_MAIN, header=None)
+            # Limit rows for performance if needed
+            df_raw = df_raw.iloc[:300]
+
+        # --- PARSING LOGIC (Same for both) ---
+        # 1. Find the Header Row (Look for 'Outrights')
+        header_row_idx = -1
+        for i in range(10): # Check first 10 rows
+            row_vals = [str(x) for x in df_raw.iloc[i].values]
+            if "Outrights" in row_vals or "Spread" in row_vals:
+                header_row_idx = i
                 break
         
-        if not found_header:
-            return pd.DataFrame(), "Could not find headers in DAP_Main"
+        if header_row_idx == -1:
+            return pd.DataFrame(), "Header 'Outrights' not found in DAP_Main"
 
-        headers = raw_values.iloc[header_idx].tolist()
-        idxs = get_column_indices(headers)
-        
-        market_data = {}
-        
-        # Helper
-        def clean_val(val):
+        # Get Headers and Data
+        headers = [str(x).strip() for x in df_raw.iloc[header_row_idx].values]
+        data_rows = df_raw.iloc[header_row_idx+1:].reset_index(drop=True)
+
+        # 2. Identify Column Indices dynamically
+        cols = {
+            'out_name': -1, 'out_last': -1, 'out_tv': -1,
+            'spd_name': -1, 'spd_last': -1,
+            'fly_name': -1, 'fly_last': -1
+        }
+
+        # Heuristic search through headers
+        for idx, h in enumerate(headers):
+            h_lower = h.lower()
+            # Outrights (usually Col A/B)
+            if idx < 10 and ('outright' in h_lower or 'symbol' in h_lower): cols['out_name'] = idx
+            if idx < 10 and ('last' in h_lower or 'price' in h_lower) and cols['out_last'] == -1: cols['out_last'] = idx
+            if idx < 15 and 'tick value' in h_lower: cols['out_tv'] = idx
+            
+            # Spreads (Middle)
+            if idx > 10 and idx < 20 and 'spread' in h_lower: cols['spd_name'] = idx
+            if idx > 10 and idx < 25 and ('last' in h_lower or 'ltp' in h_lower) and cols['spd_last'] == -1 and idx > cols['spd_name']: cols['spd_last'] = idx
+
+            # Flies (Right)
+            if idx > 20 and 'fly' in h_lower: cols['fly_name'] = idx
+            if idx > 20 and ('last' in h_lower or 'ltp' in h_lower) and cols['fly_last'] == -1 and idx > cols['fly_name']: cols['fly_last'] = idx
+
+        # Fallbacks if headers are ambiguous (based on your file structure)
+        if cols['out_name'] == -1: cols['out_name'] = 1 # Col B usually
+        if cols['out_last'] == -1: cols['out_last'] = 3 
+        if cols['spd_name'] == -1: cols['spd_name'] = 13
+        if cols['spd_last'] == -1: cols['spd_last'] = 14
+        if cols['fly_name'] == -1: cols['fly_name'] = 25
+        if cols['fly_last'] == -1: cols['fly_last'] = 26
+
+        market_list = []
+
+        def clean_float(x):
             try:
-                return float(val)
+                return float(x)
             except:
                 return 0.0
 
-        # Iterate rows after header
-        for i in range(header_idx + 1, len(raw_values)):
-            row = raw_values.iloc[i]
+        for i, row in data_rows.iterrows():
+            # Outright
+            if cols['out_name'] != -1:
+                name = str(row[cols['out_name']])
+                if name and name != 'nan' and name != 'None':
+                    market_list.append({
+                        "Instrument": name,
+                        "Type": "Outright",
+                        "Price": clean_float(row[cols['out_last']]),
+                        "TickValue": clean_float(row[cols['out_tv']]) if cols['out_tv'] != -1 else 100.0
+                    })
             
-            # --- Outrights ---
-            name = row[idxs['outright_name']]
-            if name and isinstance(name, str) and len(name) < 10:
-                market_data[name] = {
-                    "Type": "Outright",
-                    "Price": clean_val(row[idxs['outright_last']]),
-                    "TickValue": clean_val(row[idxs['outright_tv']]) if idxs['outright_tv'] != -1 else 100.0
-                }
-                
-            # --- Spreads ---
-            if idxs['spread_name'] != -1:
-                s_name = row[idxs['spread_name']]
-                if s_name and isinstance(s_name, str):
-                    market_data[s_name] = {
+            # Spread
+            if cols['spd_name'] != -1:
+                name = str(row[cols['spd_name']])
+                if name and name != 'nan' and name != 'None':
+                    market_list.append({
+                        "Instrument": name,
                         "Type": "Spread",
-                        "Price": clean_val(row[idxs['spread_last']]),
-                        "TickValue": 100.0
-                    }
+                        "Price": clean_float(row[cols['spd_last']]),
+                        "TickValue": 100.0 # Default
+                    })
 
-            # --- Flies ---
-            if idxs['fly_name'] != -1:
-                f_name = row[idxs['fly_name']]
-                if f_name and isinstance(f_name, str):
-                    market_data[f_name] = {
+            # Fly
+            if cols['fly_name'] != -1:
+                name = str(row[cols['fly_name']])
+                if name and name != 'nan' and name != 'None':
+                    market_list.append({
+                        "Instrument": name,
                         "Type": "Fly",
-                        "Price": clean_val(row[idxs['fly_last']]),
-                        "TickValue": 100.0
-                    }
+                        "Price": clean_float(row[cols['fly_last']]),
+                        "TickValue": 100.0 # Default
+                    })
 
-        df = pd.DataFrame.from_dict(market_data, orient='index').reset_index().rename(columns={"index": "Instrument"})
-        return df, "Success"
+        df_final = pd.DataFrame(market_list)
+        return df_final, "Success"
 
     except Exception as e:
-        return pd.DataFrame(), f"Error parsing data: {str(e)}"
+        return pd.DataFrame(), str(e)
 
 # -----------------------------------------------------------------------------
-# MAIN APP
+# APP LOGIC
 # -----------------------------------------------------------------------------
-st.title("📊 DAP Live Manager")
+st.title("📊 DAP Manager Dashboard")
 
-# Sidebar Status
+# 1. CONNECT
+book, status, is_live = load_data()
+
+# Sidebar
 with st.sidebar:
-    st.header("Connection Status")
-    
-    book, msg, success = connect_to_excel()
-    
-    if success:
-        st.success(msg)
-        if st.button("🔄 Refresh Data"):
+    st.header("Connection")
+    if is_live:
+        st.success(f"🟢 {status}")
+        if st.button("🔄 Refresh Live"):
             st.rerun()
     else:
-        st.error("Connection Failed")
-        st.warning(msg)
-        if st.button("Retry Connection"):
+        st.warning(f"🟠 {status}")
+        st.info("Using static file mode. (Live requires Windows/Mac + Excel)")
+        if st.button("Reload File"):
+            st.cache_data.clear()
             st.rerun()
-        st.stop()
 
-# Initialize Session State
+# 2. LOAD DATA
+df_market, msg = fetch_market_data(book, is_live)
+
+if df_market.empty:
+    st.error(f"Could not load market data: {msg}")
+    st.stop()
+
+# 3. SESSION STATE (Positions)
 if 'positions' not in st.session_state:
-    st.session_state['positions'] = []
+    st.session_state.positions = []
 
 def add_pos(inst, lots, entry, tv):
-    st.session_state['positions'].append({
+    st.session_state.positions.append({
         "id": int(time.time()*1000),
         "Instrument": inst, "Lots": lots, "Entry": entry, "TV": tv
     })
 
-# Load Data
-df_market, data_msg = parse_market_data(book)
+# 4. TABS
+tab1, tab2, tab3 = st.tabs(["Monitor", "Strategy Builder", "Market Data"])
 
-if df_market.empty:
-    st.error(f"Data Error: {data_msg}")
-    st.stop()
-
-# TABS
-t1, t2, t3 = st.tabs(["Monitor", "Builder", "Raw Data"])
-
-with t1:
-    if not st.session_state['positions']:
-        st.info("No positions. Add one in the 'Builder' tab.")
+with tab1:
+    st.subheader("Your Positions")
+    if not st.session_state.positions:
+        st.info("No trades active. Go to 'Strategy Builder'.")
     else:
-        portfolio = []
+        # Calculate PnL
         total_pnl = 0.0
+        pnl_rows = []
         
-        for p in st.session_state['positions']:
-            row = df_market[df_market['Instrument'] == p['Instrument']]
-            if not row.empty:
-                curr = row.iloc[0]['Price']
-                tv = p['TV'] if p['TV'] else row.iloc[0]['TickValue']
-                # PnL logic
-                pnl = (curr - p['Entry']) * p['Lots'] * tv
-                total_pnl += pnl
-                portfolio.append({
-                    "ID": p['id'], "Instrument": p['Instrument'], 
-                    "Lots": p['Lots'], "Entry": p['Entry'], 
-                    "Live": curr, "PnL": pnl
+        for p in st.session_state.positions:
+            # Find current price
+            match = df_market[df_market['Instrument'] == p['Instrument']]
+            if not match.empty:
+                curr = match.iloc[0]['Price']
+                tv = p['TV'] if p['TV'] else match.iloc[0]['TickValue']
+                
+                # PnL Calc
+                val = (curr - p['Entry']) * p['Lots'] * tv
+                total_pnl += val
+                
+                pnl_rows.append({
+                    "ID": p['id'], "Instrument": p['Instrument'],
+                    "Lots": p['Lots'], "Entry": p['Entry'], "Live": curr,
+                    "PnL": val
                 })
             else:
-                 portfolio.append({
-                    "ID": p['id'], "Instrument": p['Instrument'], 
-                    "Lots": p['Lots'], "Entry": p['Entry'], 
-                    "Live": 0.0, "PnL": 0.0
+                pnl_rows.append({
+                    "ID": p['id'], "Instrument": p['Instrument'],
+                    "Lots": p['Lots'], "Entry": p['Entry'], "Live": 0.0,
+                    "PnL": 0.0
                 })
-        
+                
         st.metric("Total PnL", f"${total_pnl:,.2f}")
         
-        # Table
-        for item in portfolio:
+        # Display
+        for row in pnl_rows:
             c1, c2, c3, c4, c5 = st.columns([3, 1, 2, 2, 1])
-            c1.write(f"**{item['Instrument']}**")
-            c2.write(f"{item['Lots']} lots")
-            c3.write(f"@{item['Entry']}")
+            c1.markdown(f"**{row['Instrument']}**")
+            c2.text(f"{row['Lots']}")
+            c3.text(f"@{row['Entry']}")
             
-            val_color = "green" if item['PnL'] >= 0 else "red"
-            c4.markdown(f":{val_color}[${item['PnL']:,.2f}]")
+            color = "green" if row['PnL'] >= 0 else "red"
+            c4.markdown(f":{color}[${row['PnL']:,.2f}]")
             
-            if c5.button("🗑", key=item['ID']):
-                st.session_state['positions'] = [x for x in st.session_state['positions'] if x['id'] != item['ID']]
+            if c5.button("X", key=row['ID']):
+                st.session_state.positions = [x for x in st.session_state.positions if x['id'] != row['ID']]
                 st.rerun()
             st.divider()
 
-with t2:
+with tab2:
     st.subheader("Add Trade")
-    # Clean list
-    opts = sorted(df_market['Instrument'].unique().tolist())
-    sel = st.selectbox("Instrument", opts)
     
-    curr_data = df_market[df_market['Instrument'] == sel].iloc[0]
-    st.caption(f"Live Price: {curr_data['Price']} | Type: {curr_data['Type']}")
+    # Filter
+    ftype = st.radio("Type", ["All", "Outright", "Spread", "Fly"], horizontal=True)
+    if ftype != "All":
+        opts = df_market[df_market['Type'] == ftype]['Instrument'].unique()
+    else:
+        opts = df_market['Instrument'].unique()
+        
+    sel = st.selectbox("Instrument", sorted(opts))
+    
+    # Details
+    det = df_market[df_market['Instrument'] == sel].iloc[0]
+    st.caption(f"Last: {det['Price']} | Type: {det['Type']}")
     
     c1, c2 = st.columns(2)
     l = c1.number_input("Lots", value=1)
-    e = c2.number_input("Entry", value=curr_data['Price'], format="%.4f")
-    tv = st.number_input("Tick Value", value=curr_data['TickValue'])
+    e = c2.number_input("Entry Price", value=det['Price'], format="%.4f")
+    tv = st.number_input("Tick Value", value=det['TickValue'])
     
-    if st.button("Add"):
+    if st.button("Add Position", type="primary"):
         add_pos(sel, l, e, tv)
         st.success("Added!")
         time.sleep(0.5)
         st.rerun()
 
-with t3:
-    st.write(df_market)
-    if st.button("Show Profit Sheet Raw"):
-        try:
-            st.write(book.sheets[SHEET_PROFIT].range('A1:Z100').options(pd.DataFrame).value)
-        except:
-            st.error("Profit sheet not found")
+with tab3:
+    st.dataframe(df_market)
